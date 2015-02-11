@@ -7,37 +7,36 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
+
+	"api_compte_est_bon/src/ceb"
 
 	"appengine"
 	"appengine/datastore"
 	"appengine/taskqueue"
 )
 
-var resultsTypes = [3]string{"pending", "ongoing", "finished"}
+// Etats du traitement d'un jeu.
+const (
+	PENDING  string = "pending"
+	ONGOING  string = "ongoing"
+	FINISHED string = "finished"
+)
 
-//Données du Jeu
-var nbPlaqueUtilise int = 6
-var plaquesPossibles = [14]int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 50, 75, 100}
-var minTotal int = 100
-var maxTotal int = 999
-
-type jeu struct {
-	Plaques []int
-	Total   int
-}
+var resultsTypes = [3]string{PENDING, ONGOING, FINISHED}
 
 type inputs struct {
-	Jeu  jeu
+	Jeu  ceb.Jeu
 	Type string
 	Min  int
 	Max  int
 }
 
 type solution struct {
-	Jeu            jeu
+	Jeu            ceb.Jeu
 	TempsExecution int
 	NbOperations   int
-	Resultats      []string
+	Resultats      string
 }
 
 func contains(str string, ts []string) bool {
@@ -49,7 +48,7 @@ func contains(str string, ts []string) bool {
 	return false
 }
 
-func genKey(j jeu) string {
+func genStringID(j ceb.Jeu) string {
 	sort.Ints(j.Plaques)
 	var key string
 	for i, p := range j.Plaques {
@@ -64,60 +63,51 @@ func genKey(j jeu) string {
 	return key
 }
 
-func (j *jeu) checkJeu() bool {
-	if len(j.Plaques) != nbPlaqueUtilise {
-		return false
-	}
-
-	for _, p := range j.Plaques {
-		b := false
-		for _, pp := range plaquesPossibles {
-			if p == pp {
-				b = true
-				break
-			}
+func getParamsJeu(r *http.Request) (j ceb.Jeu, err error) {
+	t := strings.Split(r.FormValue("Plaques"), ",")
+	for _, p := range t {
+		i, err := strconv.Atoi(p)
+		if err != nil {
+			return ceb.Jeu{}, err
 		}
-		if b == false {
-			return false
-		}
+		j.Plaques = append(j.Plaques, i)
 	}
-
-	if minTotal > j.Total || j.Total > maxTotal {
-		return false
+	j.Total, err = strconv.Atoi(r.FormValue("Total"))
+	if err != nil {
+		return ceb.Jeu{}, err
 	}
-
-	return true
+	return j, nil
 }
 
 func demand(w http.ResponseWriter, r *http.Request) {
 	context := appengine.NewContext(r)
 
 	//Reception de la requete
-	var j jeu
+	var j ceb.Jeu
 	if err := json.NewDecoder(r.Body).Decode(&j); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		context.Errorf("%s", err)
 		return
 	}
 
-	if j.checkJeu() == false {
+	if j.CheckJeu() == false {
 		context.Errorf("Données du jeu invalide: Plaques: %d, Total: %d", j.Plaques, j.Total)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	var exist bool = false
-	var stringId string = genKey(j)
+	exist := false
+	stringID := genStringID(j)
 	var res interface{}
 
 	for _, t := range resultsTypes {
-		if t == "pending" || t == "ongoing" {
-			res = new(jeu)
+		if t == PENDING || t == ONGOING {
+			res = new(ceb.Jeu)
 		} else {
 			res = new(solution)
 		}
 
-		key := datastore.NewKey(context, t, stringId, 0, nil)
+		key := datastore.NewKey(context, t, stringID, 0, nil)
 		if err := datastore.Get(context, key, res); err != nil {
 			if err == datastore.ErrNoSuchEntity {
 				continue
@@ -132,23 +122,27 @@ func demand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Insertion
-	if !exist {
+	if exist == false {
 		err := datastore.RunInTransaction(context, func(c appengine.Context) error {
-			var err error = nil
+			var err error
 
-			key := datastore.NewKey(c, "pending", stringId, 0, nil)
+			key := datastore.NewKey(c, PENDING, stringID, 0, nil)
 			if _, err := datastore.Put(c, key, &j); err != nil {
 				return err
 			}
 
 			params := url.Values{}
+
+			var t []string
 			for _, p := range j.Plaques {
-				params.Add("Plaques", strconv.Itoa(p))
+				t = append(t, strconv.Itoa(p))
 			}
+
+			params.Set("Plaques", strings.Join(t, ","))
 			params.Set("Total", strconv.Itoa(j.Total))
 
-			t := taskqueue.NewPOSTTask("/solve", params)
-			if _, err = taskqueue.Add(c, t, stringId); err != nil {
+			task := taskqueue.NewPOSTTask("/solve", params)
+			if _, err = taskqueue.Add(c, task, ""); err != nil {
 				return err
 			}
 
@@ -160,6 +154,65 @@ func demand(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func solve(w http.ResponseWriter, r *http.Request) {
+	context := appengine.NewContext(r)
+
+	j, err := getParamsJeu(r)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		context.Errorf("%s", err)
+		return
+	}
+
+	if j.CheckJeu() == false {
+		context.Errorf("Données du jeu invalide: Plaques: %d, Total: %d", j.Plaques, j.Total)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	//Generation de la Key
+	k := genStringID(j)
+	//Netoyage de pending
+	err = datastore.RunInTransaction(context, func(c appengine.Context) error {
+		var err error
+		key := datastore.NewKey(c, PENDING, k, 0, nil)
+		if err = datastore.Delete(c, key); err != nil {
+			return err
+		}
+		//Ajout dans ongoing
+		key = datastore.NewKey(c, ONGOING, k, 0, nil)
+		if _, err = datastore.Put(c, key, &j); err != nil {
+			return err
+		}
+
+		//Résolution du compte est bon
+		var sol solution
+		sol.Resultats = j.Resolv()
+		sol.Jeu = j
+
+		//Netoyage de ongoing
+		key = datastore.NewKey(c, ONGOING, k, 0, nil)
+		if err = datastore.Delete(c, key); err != nil {
+			return err
+		}
+
+		//Ajout dans finised
+		key = datastore.NewKey(c, FINISHED, k, 0, nil)
+		if _, err = datastore.Put(c, key, &sol); err != nil {
+			return err
+		}
+
+		return err
+	}, &datastore.TransactionOptions{XG: true})
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		context.Errorf("%s", err)
+		return
+	}
+	return
 }
 
 func results(w http.ResponseWriter, r *http.Request) {
@@ -183,17 +236,17 @@ func results(w http.ResponseWriter, r *http.Request) {
 	//Composition et execution de la requête
 	var res interface{}
 
-	if !reflect.DeepEqual(i.Jeu, jeu{}) {
-		if i.Jeu.checkJeu() == false {
+	if !reflect.DeepEqual(i.Jeu, ceb.Jeu{}) {
+		if i.Jeu.CheckJeu() == false {
 			context.Errorf("Données du jeu invalide: Plaques: %d, Total: %d", i.Jeu.Plaques, i.Jeu.Total)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		key := datastore.NewKey(context, i.Type, genKey(i.Jeu), 0, nil)
+		key := datastore.NewKey(context, i.Type, genStringID(i.Jeu), 0, nil)
 
-		if i.Type == "pending" || i.Type == "ongoing" {
-			res = new(jeu)
+		if i.Type == PENDING || i.Type == ONGOING {
+			res = new(ceb.Jeu)
 		} else {
 			res = new(solution)
 		}
@@ -211,8 +264,8 @@ func results(w http.ResponseWriter, r *http.Request) {
 			q.Limit(i.Max)
 		}
 
-		if i.Type == "pending" || i.Type == "ongoing" {
-			res = new([]jeu)
+		if i.Type == PENDING || i.Type == ONGOING {
+			res = new([]ceb.Jeu)
 		} else {
 			res = new([]solution)
 		}
@@ -238,4 +291,5 @@ func results(w http.ResponseWriter, r *http.Request) {
 func init() {
 	http.HandleFunc("/demand", demand)
 	http.HandleFunc("/results", results)
+	http.HandleFunc("/solve", solve)
 }
