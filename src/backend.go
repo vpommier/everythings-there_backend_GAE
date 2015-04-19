@@ -317,6 +317,7 @@ func results(w http.ResponseWriter, r *http.Request) {
 
 	//Renvoi de la réponse
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(js)
 }
 
