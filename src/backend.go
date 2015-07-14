@@ -3,12 +3,14 @@ package backend
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
 
 	"appengine"
 	"appengine/datastore"
+	"appengine/taskqueue"
 )
 
 var resultsTypes = [3]string{"pending", "ongoing", "finished"}
@@ -87,6 +89,79 @@ func (j *jeu) checkJeu() bool {
 	return true
 }
 
+func demand(w http.ResponseWriter, r *http.Request) {
+	context := appengine.NewContext(r)
+
+	//Reception de la requete
+	var j jeu
+	if err := json.NewDecoder(r.Body).Decode(&j); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		context.Errorf("%s", err)
+		return
+	}
+
+	if j.checkJeu() == false {
+		context.Errorf("Données du jeu invalide: Plaques: %d, Total: %d", j.Plaques, j.Total)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var exist bool = false
+	var stringId string = genKey(j)
+	var res interface{}
+
+	for _, t := range resultsTypes {
+		if t == "pending" || t == "ongoing" {
+			res = new(jeu)
+		} else {
+			res = new(solution)
+		}
+
+		key := datastore.NewKey(context, t, stringId, 0, nil)
+		if err := datastore.Get(context, key, res); err != nil {
+			if err == datastore.ErrNoSuchEntity {
+				continue
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				context.Errorf("%s", err)
+				return
+			}
+		} else {
+			exist = true
+		}
+	}
+
+	// Insertion
+	if !exist {
+		err := datastore.RunInTransaction(context, func(c appengine.Context) error {
+			var err error = nil
+
+			key := datastore.NewKey(c, "pending", stringId, 0, nil)
+			if _, err := datastore.Put(c, key, &j); err != nil {
+				return err
+			}
+
+			params := url.Values{}
+			for _, p := range j.Plaques {
+				params.Add("Plaques", strconv.Itoa(p))
+			}
+			params.Set("Total", strconv.Itoa(j.Total))
+
+			t := taskqueue.NewPOSTTask("/solve", params)
+			if _, err = taskqueue.Add(c, t, stringId); err != nil {
+				return err
+			}
+
+			return err
+		}, nil)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			context.Errorf("%s", err)
+			return
+		}
+	}
+}
+
 func results(w http.ResponseWriter, r *http.Request) {
 	context := appengine.NewContext(r)
 
@@ -161,5 +236,6 @@ func results(w http.ResponseWriter, r *http.Request) {
 }
 
 func init() {
+	http.HandleFunc("/demand", demand)
 	http.HandleFunc("/results", results)
 }
