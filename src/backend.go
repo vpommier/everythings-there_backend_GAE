@@ -23,6 +23,11 @@ const (
 	FINISHED string = "finished"
 )
 
+// Namespace par défaut.
+const (
+	DEFAULT_CONTEXT string = "epsi"
+)
+
 var resultsTypes = [3]string{PENDING, ONGOING, FINISHED}
 
 type inputs struct {
@@ -63,6 +68,19 @@ func genStringID(j ceb.Jeu) string {
 	return key
 }
 
+func setNamespace(context appengine.Context, r *http.Request) (c appengine.Context, err error) {
+	if n := r.Header.Get("User"); n != "" {
+		if c, err = appengine.Namespace(context, n); err != nil {
+			return nil, err
+		}
+	} else {
+		if c, err = appengine.Namespace(context, DEFAULT_CONTEXT); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
 func getParamsJeu(r *http.Request) (j ceb.Jeu, err error) {
 	t := strings.Split(r.FormValue("Plaques"), ",")
 	for _, p := range t {
@@ -81,6 +99,13 @@ func getParamsJeu(r *http.Request) (j ceb.Jeu, err error) {
 
 func demand(w http.ResponseWriter, r *http.Request) {
 	context := appengine.NewContext(r)
+
+	context, err := setNamespace(context, r)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		context.Errorf("%s", err)
+		return
+	}
 
 	//Reception de la requete
 	var j ceb.Jeu
@@ -217,6 +242,13 @@ func solve(w http.ResponseWriter, r *http.Request) {
 
 func results(w http.ResponseWriter, r *http.Request) {
 	context := appengine.NewContext(r)
+
+	context, err := setNamespace(context, r)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		context.Errorf("%s", err)
+		return
+	}
 
 	//Reception de la requete
 	var i inputs
